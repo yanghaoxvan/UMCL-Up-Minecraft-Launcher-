@@ -1,8 +1,8 @@
 // 本软件不提供，不分发任何游戏本体，仅提供网络下载逻辑，真要起诉的话投诉BMCAPI
-// 编译：g++ main.cpp -o UMCL.exe -mwindows -municode -std=c++17
+// 编译：g++ main.cpp -o UMCL.exe -mwindows -municode -std=c++17 -O2
 //        -lcomctl32 -lgdiplus -lurlmon -lshell32 -lcomdlg32
-//        -lwinhttp -lole32 -loleaut32 -luuid -lm
-// 代码开始 V1.3
+//        -lwinhttp -lole32 -loleaut32 -luuid -lm -lpthread -lbcrypt
+// 代码开始 1.0-alpha (绝对禁用 -D + 假死续命机制)
 
 #define WIN32_LEAN_AND_MEAN
 
@@ -11,6 +11,7 @@
 #include <windowsx.h>
 #include <commctrl.h>
 #include <gdiplus.h>
+#include <bcrypt.h>
 #include <string>
 #include <vector>
 #include <fstream>
@@ -22,9 +23,13 @@
 #include <mutex>
 #include <queue>
 #include <condition_variable>
+#include <set>
+#include <algorithm>
+#include <regex>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "bcrypt.lib")
 
 namespace fs = std::filesystem;
 using namespace Gdiplus;
@@ -36,6 +41,7 @@ using namespace Gdiplus;
 #define ID_EDIT_LOG        1004
 #define ID_COMBO_JAVA      1005
 #define ID_BTN_LAUNCH      1006
+#define ID_BTN_CHECK       1007
 
 #define IDD_LOCAL_DLG      2000
 #define IDC_LOCAL_LIST     2001
@@ -72,8 +78,9 @@ static bool DownloadFromTxtList(const std::wstring& exeDir, const std::wstring& 
 static bool ParseVanillaWithNode(const std::wstring& exeDir, const std::wstring& mcVer);
 static bool ParseFabricWithNode(const std::wstring& exeDir, const std::wstring& mcVer);
 static bool ParseAndInstallForgeWithNode(const std::wstring& exeDir, const std::wstring& mcVer, const std::wstring& jdkVer);
-static std::wstring BuildClasspath(const std::wstring& gameDir, const std::wstring& actualVer);
+static std::wstring BuildClasspath(const std::wstring& gameDir, const std::wstring& actualVer, bool strictForge);
 static bool ShowLocalVersionDialog(HWND hParent, const std::vector<std::wstring>& versions, std::wstring& outVer);
+static std::wstring ExtractJsonStringValue(const std::string& content, const std::string& key);
 
 static void AppendLog(const std::wstring& line)
 {
@@ -113,6 +120,16 @@ static std::wstring Utf8ToWide(const std::string& s)
 	MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], len);
 	return w;
 }
+
+static std::string WideToUtf8(const std::wstring& w)
+{
+	if (w.empty()) return "";
+	int len = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+	std::string s(len, '\0');
+	WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], len, nullptr, nullptr);
+	return s;
+}
+
 static std::wstring NormalizeWinPath(std::wstring s)
 {
 	for (auto& c : s) if (c == L'/') c = L'\\';
@@ -223,6 +240,227 @@ static std::wstring FindJavaExeRecursive(const std::wstring& dir)
 	return found;
 }
 
+static std::string ReadWholeFileA(const std::wstring& path)
+{
+	std::ifstream ifs(fs::path(path), std::ios::binary);
+	if (!ifs) return "";
+	std::stringstream ss; ss << ifs.rdbuf();
+	return ss.str();
+}
+
+static std::wstring CalculateSHA1(const std::wstring& filePath)
+{
+	std::ifstream file(fs::path(filePath), std::ios::binary);
+	if (!file) return L"";
+	
+	BCRYPT_ALG_HANDLE hAlg = nullptr;
+	BCRYPT_HASH_HANDLE hHash = nullptr;
+	DWORD cbHashObject = 0, cbData = 0, cbHash = 0, cbResult = 0;
+	PBYTE pbHashObject = nullptr, pbHash = nullptr;
+	std::vector<BYTE> buffer(65536);
+	std::wstring result;
+	
+	if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA1_ALGORITHM, nullptr, 0) == 0)
+	{
+		BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, (PBYTE)&cbHashObject, sizeof(DWORD), &cbResult, 0);
+		BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH, (PBYTE)&cbHash, sizeof(DWORD), &cbResult, 0);
+		
+		pbHashObject = (PBYTE)HeapAlloc(GetProcessHeap(), 0, cbHashObject);
+		pbHash = (PBYTE)HeapAlloc(GetProcessHeap(), 0, cbHash);
+		
+		if (pbHashObject && pbHash)
+		{
+			if (BCryptCreateHash(hAlg, &hHash, pbHashObject, cbHashObject, nullptr, 0, 0) == 0)
+			{
+				while (file.read((char*)buffer.data(), buffer.size()) || file.gcount() > 0)
+				{
+					BCryptHashData(hHash, buffer.data(), (ULONG)file.gcount(), 0);
+				}
+				BCryptFinishHash(hHash, pbHash, cbHash, 0);
+				
+				wchar_t hex[3];
+				for (DWORD i = 0; i < cbHash; ++i)
+				{
+					swprintf_s(hex, L"%02x", pbHash[i]);
+					result += hex;
+				}
+				BCryptDestroyHash(hHash);
+			}
+		}
+		if (pbHashObject) HeapFree(GetProcessHeap(), 0, pbHashObject);
+		if (pbHash) HeapFree(GetProcessHeap(), 0, pbHash);
+		BCryptCloseAlgorithmProvider(hAlg, 0);
+	}
+	return result;
+}
+
+struct CheckTask {
+	std::wstring url;
+	std::wstring absPath;
+	std::string expectSha1;
+};
+
+static std::mutex g_taskMutex;
+static std::vector<CheckTask> g_mismatchFiles;
+
+static void ProcessCheckFile(const std::wstring& gameDir, const std::wstring& filePath, const std::string& expectSha1, const std::wstring& url)
+{
+	if (!FileExistsW(filePath))
+	{
+		std::lock_guard<std::mutex> lock(g_taskMutex);
+		g_mismatchFiles.push_back({ url, filePath, expectSha1 });
+		return;
+	}
+	
+	std::wstring sha1 = CalculateSHA1(filePath);
+	std::string sha1Str = WideToUtf8(sha1);
+	
+	if (_stricmp(sha1Str.c_str(), expectSha1.c_str()) != 0)
+	{
+		AppendLog(L"[CHECK] 校验失败: " + filePath);
+		std::lock_guard<std::mutex> lock(g_taskMutex);
+		g_mismatchFiles.push_back({ url, filePath, expectSha1 });
+	}
+}
+
+static void DoFixDownload()
+{
+	if (g_mismatchFiles.empty()) return;
+	
+	std::atomic<int> okCount(0), failCount(0);
+	
+	auto worker = [&]() {
+		while (true) {
+			CheckTask task;
+			{
+				std::lock_guard<std::mutex> lock(g_taskMutex);
+				if (g_mismatchFiles.empty()) return;
+				task = g_mismatchFiles.back();
+				g_mismatchFiles.pop_back();
+			}
+			
+			std::wstring fixUrl = task.url;
+			if (fixUrl.find(L"resources.download.minecraft.net") != std::wstring::npos) {
+				size_t pos = fixUrl.find(L"resources.download.minecraft.net");
+				fixUrl.replace(pos, 32, L"bmclapi2.bangbang93.com/assets");
+			} else if (fixUrl.find(L"libraries.minecraft.net") != std::wstring::npos) {
+				size_t pos = fixUrl.find(L"libraries.minecraft.net");
+				fixUrl.replace(pos, 23, L"bmclapi2.bangbang93.com/maven");
+			}
+			
+			AppendLog(L"[FIX] 重新下载: " + task.absPath);
+			bool ok = false;
+			if (SmartDownloadMCFile(task.url, task.absPath)) ok = true;
+			else if (SmartDownloadMCFile(fixUrl, task.absPath)) ok = true;
+			
+			if (ok) okCount++;
+			else failCount++;
+		}
+	};
+	
+	std::vector<std::thread> threads;
+	for (int i = 0; i < 8; ++i) threads.emplace_back(worker);
+	for (auto& t : threads) t.join();
+	
+	AppendLog(L"[FIX] 修复完成！成功: " + std::to_wstring(okCount) + L"，失败: " + std::to_wstring(failCount));
+}
+
+static void RunFullCheck(const std::wstring& gameDir, const std::wstring& mcVer)
+{
+	AppendLog(L"[CHECK] 开始进行全量资源文件校验 (8线程)");
+	
+	std::wstring versionJson = gameDir + L"\\versions\\" + mcVer + L"\\" + mcVer + L".json";
+	if (!FileExistsW(versionJson))
+	{
+		AppendLog(L"[ERROR] 找不到版本 JSON: " + versionJson);
+		return;
+	}
+	
+	std::string json = ReadWholeFileA(versionJson);
+	
+	std::regex libRegex(R"re("path"\s*:\s*"([^"]+)"\s*,\s*"sha1"\s*:\s*"([^"]+)"\s*,\s*"size"\s*:\s*\d+\s*,\s*"url"\s*:\s*"([^"]+)")re");
+	auto libBegin = std::sregex_iterator(json.begin(), json.end(), libRegex);
+	auto libEnd = std::sregex_iterator();
+	for (auto it = libBegin; it != libEnd; ++it)
+	{
+		std::wstring path = Utf8ToWide((*it)[1].str());
+		std::string sha1 = (*it)[2].str();
+		std::wstring url = Utf8ToWide((*it)[3].str());
+		
+		if (path.find(L"-natives-macos") != std::wstring::npos ||
+			path.find(L"-natives-linux") != std::wstring::npos ||
+			path.find(L"-natives-osx") != std::wstring::npos ||
+			path.find(L"java-objc-bridge") != std::wstring::npos ||
+			path.find(L"netty-transport-native-epoll") != std::wstring::npos)
+		{
+			continue;
+		}
+		
+		std::wstring absPath = NormalizeWinPath(gameDir + L"\\libraries\\" + path);
+		ProcessCheckFile(gameDir, absPath, sha1, url);
+	}
+	
+	std::regex clientRegex(R"re("client"\s*:\s*\{[^}]*"sha1"\s*:\s*"([^"]+)"[^}]*"url"\s*:\s*"([^"]+)")re");
+	std::smatch match;
+	if (std::regex_search(json, match, clientRegex))
+	{
+		std::string sha1 = match[1].str();
+		std::wstring url = Utf8ToWide(match[2].str());
+		std::wstring absPath = NormalizeWinPath(gameDir + L"\\versions\\" + mcVer + L"\\" + mcVer + L".jar");
+		ProcessCheckFile(gameDir, absPath, sha1, url);
+	}
+	
+	std::wstring assetIndexId = ExtractJsonStringValue(json, "assetIndex");
+	if (!assetIndexId.empty())
+	{
+		std::wstring indexJsonPath = NormalizeWinPath(gameDir + L"\\assets\\indexes\\" + assetIndexId + L".json");
+		if (FileExistsW(indexJsonPath))
+		{
+			std::string assetJson = ReadWholeFileA(indexJsonPath);
+			std::regex assetRegex(R"re("hash"\s*:\s*"([^"]+)"[^}]*"path"\s*:\s*"([^"]+)")re");
+			auto assetBegin = std::sregex_iterator(assetJson.begin(), assetJson.end(), assetRegex);
+			auto assetEnd = std::sregex_iterator();
+			for (auto it = assetBegin; it != assetEnd; ++it)
+			{
+				std::string hash = (*it)[1].str();
+				std::wstring path = Utf8ToWide((*it)[2].str());
+				std::wstring absPath = NormalizeWinPath(gameDir + L"\\assets\\objects\\" + path);
+				std::wstring url = L"https://resources.download.minecraft.net/" + path.substr(0, 2) + L"/" + path.substr(2);
+				ProcessCheckFile(gameDir, absPath, hash, url);
+			}
+		}
+	}
+	
+	AppendLog(L"[CHECK] 校验完成，发现 " + std::to_wstring(g_mismatchFiles.size()) + L" 个文件存在差异或缺失。");
+	DoFixDownload();
+}
+
+static std::wstring GetXmxArg()
+{
+	MEMORYSTATUSEX memInfo;
+	memInfo.dwLength = sizeof(MEMORYSTATUSEX);
+	if (GlobalMemoryStatusEx(&memInfo))
+	{
+		DWORDLONG totalPhysMem = memInfo.ullTotalPhys;
+		DWORDLONG physMemMB = totalPhysMem / (1024 * 1024);
+		
+		if (physMemMB <= 3096) {
+			AppendLog(L"[JAVA] 检测到低内存配置 (" + std::to_wstring(physMemMB) + L"MB)，采用 512M + G1GC 优化");
+			return L"-Xmx512M -Xms256M -XX:+UseG1GC -XX:MaxMetaspaceSize=128M -XX:+UseStringDeduplication";
+		}
+		else if (physMemMB <= 8192) {
+			AppendLog(L"[JAVA] 检测到中等配置 (" + std::to_wstring(physMemMB) + L"MB)，采用 2G 内存");
+			return L"-Xmx2G -Xms1G";
+		}
+		else {
+			AppendLog(L"[JAVA] 检测到高配置 (" + std::to_wstring(physMemMB) + L"MB)，采用 3G 内存");
+			return L"-Xmx3G -Xms1G";
+		}
+	}
+	AppendLog(L"[WRN] 无法获取物理内存，默认采用 2G 内存");
+	return L"-Xmx2G -Xms1G";
+}
+
 static std::wstring ToAbs_GameDir(const std::wstring& exeDir, const std::wstring& rel)
 {
 	if (rel.size() >= 2 && rel[1] == L':') return NormalizeWinPath(rel);
@@ -259,12 +497,29 @@ static void KillChildProcesses()
 	system("taskkill /F /IM powershell.exe >nul 2>&1");
 }
 
+static void CleanupTempFiles()
+{
+	std::wstring gameDir = GetGameDir();
+	std::vector<std::wstring> filesToDelete = {
+		gameDir + L"\\args.txt",
+		gameDir + L"\\temp\\cp.txt",
+		gameDir + L"\\temp\\launch_main.txt"
+	};
+	for (const auto& f : filesToDelete) {
+		if (FileExistsW(f)) {
+			DeleteFileW(f.c_str());
+		}
+	}
+}
+
 static std::wstring PsEscapeSingleQuote(const std::wstring& s)
 {
 	std::wstring out; out.reserve(s.size() + 8);
 	for (wchar_t c : s) { if (c == L'\'') out += L"''"; else out.push_back(c); }
 	return out;
 }
+
+// ============ 下载函数（加入 5 秒假死检测 + 15 分钟无增长才杀） ============
 static bool HttpDownloadToFile(const std::wstring& url, const std::wstring& localPath)
 {
 	if (g_bIsExitRequested) return false;
@@ -272,9 +527,14 @@ static bool HttpDownloadToFile(const std::wstring& url, const std::wstring& loca
 	DeleteFileW(localPath.c_str());
 	std::wstring urlEsc = PsEscapeSingleQuote(url);
 	std::wstring pathEsc = PsEscapeSingleQuote(localPath);
+	
 	std::wstring cmd = L"powershell -NoProfile -ExecutionPolicy Bypass -Command \""
-	L"Invoke-WebRequest -Uri '" + urlEsc + L"' -OutFile '" + pathEsc +
-	L"' -UserAgent 'Mozilla/5.0' -UseBasicParsing\"";
+	L"[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; "
+	L"$wc = New-Object System.Net.WebClient; "
+	L"$wc.Headers.Add('User-Agent', 'Mozilla/5.0'); "
+	L"$wc.DownloadFile('" + urlEsc + L"', '" + pathEsc + L"'); "
+	L"if ($wc) { $wc.Dispose() }\"";
+	
 	STARTUPINFOW si{}; si.cb = sizeof(si);
 	si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
 	PROCESS_INFORMATION pi{};
@@ -283,16 +543,38 @@ static bool HttpDownloadToFile(const std::wstring& url, const std::wstring& loca
 							 CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
 	if (!ok) return false;
 	
-	bool finished = false, killed = false;
 	DWORD startTime = GetTickCount();
+	DWORD lastChangeTime = startTime;
+	ULARGE_INTEGER lastSize = { 0 };
+	bool finished = false;
+	bool killed = false;
+	
 	for (;;)
 	{
-		if (g_bIsExitRequested) { TerminateProcess(pi.hProcess, 1); killed = true; break; }
+		if (g_bIsExitRequested)
+		{
+			TerminateProcess(pi.hProcess, 1);
+			killed = true;
+			break;
+		}
+		
 		DWORD wr = WaitForSingleObject(pi.hProcess, 200);
 		if (wr == WAIT_OBJECT_0) { finished = true; break; }
 		if (wr == WAIT_FAILED) break;
-		if (GetTickCount() - startTime > 60000) { TerminateProcess(pi.hProcess, 1); killed = true; break; }
+		
+		DWORD now = GetTickCount();
+		
+		
+		// 连续 15 分钟无增长才杀
+		if (now - lastChangeTime >= 900000)
+		{
+			AppendLog(L"[DL] 连续 15 分钟无进度，判定假死，强制终止");
+			TerminateProcess(pi.hProcess, 1);
+			killed = true;
+			break;
+		}
 	}
+	
 	DWORD code = 1;
 	if (finished) GetExitCodeProcess(pi.hProcess, &code);
 	CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
@@ -300,6 +582,7 @@ static bool HttpDownloadToFile(const std::wstring& url, const std::wstring& loca
 	if (!finished || code != 0) { DeleteFileW(localPath.c_str()); return false; }
 	return FileExistsW(localPath);
 }
+
 static bool TryDownloadWithProxyFallback(const std::wstring& url, const std::wstring& localPath)
 {
 	if (g_bIsExitRequested) return false;
@@ -444,18 +727,19 @@ static std::wstring GetJavaRootDir() { return GetGameDir() + L"\\OpenJDK-JRE"; }
 static std::wstring GetJavaVersionDir(const std::wstring& ver) { return GetJavaRootDir() + L"\\JRE" + ver; }
 static std::wstring Get64BitHardcodedUrl(const std::wstring& ver)
 {
-	if (ver == L"8") return L"https://v6.gh-proxy.org/https://github.com/adoptium/temurin8-binaries/releases/download/jdk8u504-b01/OpenJDK8U-jre_x64_windows_hotspot_8u504b01.zip";
-	if (ver == L"11") return L"https://v6.gh-proxy.org/https://github.com/adoptium/temurin11-binaries/releases/download/jdk-11.0.32.1%2B1/OpenJDK11U-jre_x64_windows_hotspot_11.0.32.1_1.zip";
-	if (ver == L"17") return L"https://v6.gh-proxy.org/https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.20.1%2B1/OpenJDK17U-jre_x64_windows_hotspot_17.0.20.1_1.zip";
-	if (ver == L"21") return L"https://v6.gh-proxy.org/https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.13%2B9/OpenJDK21U-jre_x64_windows_hotspot_21.0.13_9.zip";
-	if (ver == L"25") return L"https://v6.gh-proxy.org/https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jre_x64_windows_hotspot_25.0.5_8.zip";
+	if (ver == L"8") return L"https://download.bell-sw.com/java/8u514+5/bellsoft-jre8u514+5-windows-amd64.zip";
+	if (ver == L"11") return L"https://download.bell-sw.com/java/11.0.33.1+5/bellsoft-jre11.0.33.1+5-windows-amd64.zip";
+	if (ver == L"17") return L"https://download.bell-sw.com/java/17.0.21.1+5/bellsoft-jre17.0.21.1+5-windows-amd64.zip";
+	if (ver == L"21") return L"https://download.bell-sw.com/java/21.0.13.1+5/bellsoft-jre21.0.13.1+5-windows-amd64.zip";
+	if (ver == L"25") return L"https://download.bell-sw.com/java/25.0.5.1+5/bellsoft-jre25.0.5.1+5-windows-amd64.zip";
 	return L"";
 }
 static std::wstring Get32BitHardcodedUrl(const std::wstring& ver)
 {
-	if (ver == L"8") return L"https://v6.gh-proxy.org/https://github.com/adoptium/temurin8-binaries/releases/download/jdk8u472-b08/OpenJDK8U-jre_x86-32_windows_hotspot_8u472b08.zip";
-	if (ver == L"11") return L"https://v6.gh-proxy.org/https://github.com/adoptium/temurin11-binaries/releases/download/jdk-11.0.29%2B7/OpenJDK11U-jre_x86-32_windows_hotspot_11.0.29_7.zip";
-	if (ver == L"17") return L"https://v6.gh-proxy.org/https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.17%2B10/OpenJDK17U-jre_x86-32_windows_hotspot_17.0.17_10.zip";
+	if (ver == L"8") return L"https://download.bell-sw.com/java/8u514+5/bellsoft-jre8u514+5-windows-i586.zip";
+	if (ver == L"11") return L"https://download.bell-sw.com/java/11.0.33.1+5/bellsoft-jre11.0.33.1+5-windows-i586.zip";
+	if (ver == L"17") return L"https://download.bell-sw.com/java/17.0.21.1+5/bellsoft-jre17.0.21.1+5-windows-i586.zip";
+	if (ver == L"21") return L"https://download.bell-sw.com/java/21.0.13.1+5/bellsoft-jre21.0.13.1+5-windows-i586.zip";
 	return L"";
 }
 static bool DownloadJavaForHost(const std::wstring& jdkVer)
@@ -729,9 +1013,6 @@ static std::wstring FindListFile(const std::wstring& exeDir, const std::wstring&
 	return L"";
 }
 
-// =====================================================================
-//  ★ 流水线第 1 步：无论选什么，必须原版先行（下核心、assets、依赖库）
-// =====================================================================
 static bool ParseVanillaWithNode(const std::wstring& exeDir, const std::wstring& mcVer)
 {
 	if (g_bIsExitRequested) return false;
@@ -771,18 +1052,23 @@ static bool ParseVanillaWithNode(const std::wstring& exeDir, const std::wstring&
 		return false;
 	}
 	
+	std::wstring coreJarPath = verDir + L"\\" + mcVer + L".jar";
+	if (!FileExistsW(coreJarPath)) {
+		AppendLog(L"[VANILLA] 正在下载原版核心 jar (BMCLAPI)...");
+		std::wstring coreUrl = L"https://bmclapi2.bangbang93.com/version/" + mcVer + L"/client";
+		if (!SmartDownloadMCFile(coreUrl, coreJarPath)) {
+			AppendLog(L"[ERROR] 原版核心 jar 下载失败！");
+			return false;
+		}
+	}
+	
 	AppendLog(L"[VANILLA] 原版流水线完成，已确保核心、assets、依赖全部就绪");
 	return true;
 }
 
-// =====================================================================
-//  ★ 流水线第 2 步：按需扩展 Fabric
-// =====================================================================
 static bool ParseFabricWithNode(const std::wstring& exeDir, const std::wstring& mcVer)
 {
 	if (g_bIsExitRequested) return false;
-	
-	// 强制依赖原版前置完成，严禁重复下载原版
 	std::wstring vanillaJar = exeDir + L"\\.minecraft\\versions\\" + mcVer + L"\\" + mcVer + L".jar";
 	if (!FileExistsW(vanillaJar)) {
 		AppendLog(L"[ERROR] [FABRIC] 流水线中断：前置原版核心缺失 " + vanillaJar);
@@ -804,7 +1090,6 @@ static bool ParseFabricWithNode(const std::wstring& exeDir, const std::wstring& 
 		return false;
 	}
 	
-	// 找 Fabric 生成的清单
 	std::wstring listPath = verDir + L"\\fabric_download_list.txt";
 	AppendLog(L"[FABRIC] 尝试读取专属库清单: " + listPath);
 	if (FileExistsW(listPath)) {
@@ -816,23 +1101,15 @@ static bool ParseFabricWithNode(const std::wstring& exeDir, const std::wstring& 
 	return true;
 }
 
-// =====================================================================
-//  ★ 流水线第 2 步：按需扩展 Forge
-// =====================================================================
 static bool ParseAndInstallForgeWithNode(const std::wstring& exeDir, const std::wstring& mcVer, const std::wstring& jdkVer)
 {
 	if (g_bIsExitRequested) return false;
 	
-	// 强制依赖原版前置完成，严禁重复下载原版
 	std::wstring vanillaJar = exeDir + L"\\.minecraft\\versions\\" + mcVer + L"\\" + mcVer + L".jar";
 	if (!FileExistsW(vanillaJar)) {
 		AppendLog(L"[ERROR] [FORGE] 流水线中断：前置原版核心缺失 " + vanillaJar);
 		return false;
 	}
-	
-	std::wstring forgeVer = mcVer + L"-forge";
-	std::wstring verDir = exeDir + L"\\.minecraft\\versions\\" + forgeVer;
-	EnsureDirectoryRecursiveW(verDir);
 	
 	std::wstring jsFetchAbs = ToAbs_ExeDir(exeDir, L"Node(YouMustNeed)v13\\parse_forge.js");
 	std::wstring tempAbs    = ToAbs_ExeDir(exeDir, L".minecraft\\temp");
@@ -844,20 +1121,21 @@ static bool ParseAndInstallForgeWithNode(const std::wstring& exeDir, const std::
 		return false;
 	}
 	
-	// 在 versions 下动态寻找 Forge 专属文件夹
-	std::wstring versionsRoot = exeDir + L"\\.minecraft\\versions";
+	std::wstring tempRoot = exeDir + L"\\.minecraft\\temp";
 	std::wstring listPath;
 	
-	std::error_code ec;
-	if (DirExistsW(versionsRoot)) {
-		for (auto& p : fs::directory_iterator(fs::path(versionsRoot), ec)) {
+	AppendLog(L"[FORGE] 正在 " + tempRoot + L" 下寻找以 " + mcVer + L" 开头的子目录...");
+	if (DirExistsW(tempRoot)) {
+		std::error_code ec;
+		for (auto& p : fs::directory_iterator(fs::path(tempRoot), ec)) {
 			if (ec) break;
 			if (!p.is_directory()) continue;
 			std::wstring folderName = p.path().filename().wstring();
-			if (folderName.find(mcVer + L"-forge") == 0) {
+			if (folderName.find(mcVer) == 0) {
 				std::wstring potentialList = p.path().wstring() + L"\\forge_download_list.txt";
 				if (FileExistsW(potentialList)) {
 					listPath = potentialList;
+					AppendLog(L"[FORGE] 命中专属子目录清单: " + listPath);
 					break;
 				}
 			}
@@ -867,35 +1145,141 @@ static bool ParseAndInstallForgeWithNode(const std::wstring& exeDir, const std::
 	if (listPath.empty()) {
 		listPath = FindListFile(exeDir, mcVer, L"download_list_forge.txt");
 		if (listPath.empty()) {
-			AppendLog(L"[ERROR] [FORGE] 找不到 forge_download_list.txt 或 download_list_forge.txt");
+			AppendLog(L"[ERROR] [FORGE] 找不到 forge_download_list.txt");
 			return false;
 		}
-	} else {
-		AppendLog(L"[FORGE] 找到专属目录清单: " + listPath);
 	}
 	
-	AppendLog(L"[FORGE] 开始下载安装器等前置...");
+	AppendLog(L"[FORGE] 开始下载安装器及前置...");
 	if (!DownloadFromTxtList(exeDir, listPath)) { AppendLog(L"[ERROR] [FORGE] 下载依赖失败"); return false; }
 	
-	// 执行安装
 	std::wstring resolvedJdk = ResolveJdkVersion(jdkVer);
 	std::wstring javaAbs = ToAbs_ExeDir(exeDir, L".minecraft\\OpenJDK-JRE\\JRE" + resolvedJdk + L"\\bin\\java.exe");
 	if (!FileExistsW(javaAbs)) javaAbs = ToAbs_ExeDir(exeDir, L".minecraft\\OpenJDK-JRE\\JRE17\\bin\\java.exe");
 	if (!FileExistsW(javaAbs)) { AppendLog(L"[ERROR] [FORGE] 找不到 Java 路径"); return false; }
 	
-	std::wstring installerAbs = ToAbs_ExeDir(exeDir, L".minecraft\\temp\\forge-installer.jar");
-	if (!FileExistsW(installerAbs)) { AppendLog(L"[ERROR] [FORGE] 找不到 installer.jar"); return false; }
+	std::wstring installerAbs;
+	AppendLog(L"[FORGE] 正在寻找真实的 forge-*-installer.jar...");
+	if (DirExistsW(tempRoot)) {
+		std::error_code ec;
+		for (auto& p : fs::recursive_directory_iterator(fs::path(tempRoot), ec)) {
+			if (ec) break;
+			if (!p.is_regular_file()) continue;
+			std::wstring fname = p.path().filename().wstring();
+			if (fname.find(L"forge") != std::wstring::npos &&
+				fname.find(L"installer") != std::wstring::npos &&
+				fname.find(L".jar") != std::wstring::npos)
+			{
+				installerAbs = p.path().wstring();
+				AppendLog(L"[FORGE] 命中真实安装器: " + installerAbs);
+				break;
+			}
+		}
+	}
 	
-	std::wstring jsInstAbs = ToAbs_ExeDir(exeDir, L"Node(YouMustNeed)v13\\parse_forge_install.js");
-	std::vector<std::wstring> argsInst; argsInst.push_back(jsInstAbs); argsInst.push_back(javaAbs); argsInst.push_back(installerAbs); argsInst.push_back(ToAbs_ExeDir(exeDir, L".minecraft"));
+	if (installerAbs.empty()) {
+		std::vector<std::wstring> fallbacks = {
+			ToAbs_ExeDir(exeDir, L".minecraft\\temp\\forge-installer.jar"),
+			ToAbs_ExeDir(exeDir, L".minecraft\\temp\\1.20.1-47.4.29\\forge-1.20.1-47.4.29-installer.jar")
+		};
+		for (auto& fb : fallbacks) {
+			if (FileExistsW(fb)) { installerAbs = fb; AppendLog(L"[FORGE] 兜底命中: " + installerAbs); break; }
+		}
+	}
 	
-	AppendLog(L"[FORGE] 调用 Node 执行 Forge 静默安装...");
-	if (!RunNodeScript(exeDir, L"Node(YouMustNeed)v13\\node.exe", argsInst, exeDir)) {
-		AppendLog(L"[ERROR] [FORGE] Node 执行 Forge 安装失败");
+	if (installerAbs.empty()) { 
+		AppendLog(L"[ERROR] [FORGE] 彻底找不到 installer.jar！"); 
+		return false; 
+	}
+	AppendLog(L"[FORGE] 使用安装器: " + installerAbs);
+	
+	std::wstring gameRootDir = exeDir + L"\\.minecraft";
+	std::wstring installCmd = L"\"" + javaAbs + L"\" -jar \"" + installerAbs + L"\" --installClient \"" + gameRootDir + L"\"";
+	
+	AppendLog(L"[FORGE] 正在拉起安装器（黑框框控制台模式）...");
+	AppendLog(L"[FORGE] 执行命令: " + installCmd);
+	
+	STARTUPINFOW si{}; 
+	si.cb = sizeof(si);
+	
+	PROCESS_INFORMATION pi{};
+	std::vector<wchar_t> cmdBuffer(installCmd.begin(), installCmd.end());
+	cmdBuffer.push_back(L'\0');
+	
+	BOOL ok = CreateProcessW(
+							 nullptr, &cmdBuffer[0],
+							 nullptr, nullptr, FALSE,
+							 CREATE_NEW_CONSOLE,
+							 nullptr,
+							 gameRootDir.c_str(),
+							 &si, &pi
+							 );
+	
+	if (!ok) {
+		AppendLog(L"[ERROR] [FORGE] 启动安装器失败，GetLastError() = " + std::to_wstring(GetLastError()));
 		return false;
 	}
 	
-	AppendLog(L"[FORGE] Forge 安装流水线完成");
+	DWORD startTime = GetTickCount();
+	bool finished = false;
+	bool killed = false;
+	
+	for (;;) {
+		if (g_bIsExitRequested) {
+			TerminateProcess(pi.hProcess, 1);
+			killed = true;
+			break;
+		}
+		DWORD wr = WaitForSingleObject(pi.hProcess, 200);
+		if (wr == WAIT_OBJECT_0) { finished = true; break; }
+		if (wr == WAIT_FAILED) break;
+		
+		if (GetTickCount() - startTime > 300000) {
+			AppendLog(L"[WRN] [FORGE] 安装超时（5分钟），强制终止！");
+			TerminateProcess(pi.hProcess, 1);
+			killed = true;
+			break;
+		}
+	}
+	
+	DWORD exitCode = 0;
+	if (finished) GetExitCodeProcess(pi.hProcess, &exitCode);
+	CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+	
+	if (killed || g_bIsExitRequested) {
+		AppendLog(L"[ERROR] [FORGE] 安装被强制中断！");
+		return false;
+	}
+	
+	if (!finished) {
+		AppendLog(L"[ERROR] [FORGE] 安装器进程异常退出或等待失败！");
+		return false;
+	}
+	
+	std::wstring expectedVerDir;
+	std::wstring versionsRoot = exeDir + L"\\.minecraft\\versions";
+	bool found = false;
+	if (DirExistsW(versionsRoot)) {
+		std::error_code ec;
+		for (auto& p : fs::directory_iterator(fs::path(versionsRoot), ec)) {
+			if (ec) break;
+			if (!p.is_directory()) continue;
+			std::wstring folderName = p.path().filename().wstring();
+			if (folderName.find(mcVer + L"-forge") == 0) {
+				expectedVerDir = p.path().wstring();
+				found = true;
+				break;
+			}
+		}
+	}
+	
+	if (!found) {
+		AppendLog(L"[ERROR] [FORGE] 安装器已退出（exitCode=" + std::to_wstring(exitCode) + L"），但未在 versions 下找到 " + mcVer + L"-forge 目录！");
+		AppendLog(L"[ERROR] [FORGE] 这可能是因为：1. 网络问题导致依赖下载失败；2. 安装器内部报错但没输出；3. Java 版本不兼容。");
+		return false;
+	}
+	
+	AppendLog(L"[FORGE] Forge 安装流水线完美收官！目标目录: " + expectedVerDir);
 	return true;
 }
 
@@ -1037,6 +1421,28 @@ static bool ShowLocalVersionDialog(HWND hParent, const std::vector<std::wstring>
 	return true;
 }
 
+static const wchar_t* GetUIFontFace(bool bold = false)
+{
+	static const wchar_t* normal = L"Microsoft YaHei";
+	static const wchar_t* normalBold = L"Microsoft YaHei";
+	static bool init = false;
+	if (!init) {
+		OSVERSIONINFOEXW osvi = { sizeof(osvi) };
+		DWORDLONG const dwlConditionMask = VerSetConditionMask(
+															   VerSetConditionMask(0, VER_MAJORVERSION, VER_GREATER_EQUAL),
+															   VER_MINORVERSION, VER_GREATER_EQUAL);
+		osvi.dwMajorVersion = 10;
+		osvi.dwMinorVersion = 0;
+		osvi.dwPlatformId = VER_PLATFORM_WIN32_NT;
+		if (VerifyVersionInfoW(&osvi, VER_MAJORVERSION | VER_MINORVERSION | VER_PLATFORMID, dwlConditionMask)) {
+			normal = L"Microsoft YaHei UI";
+			normalBold = L"Microsoft YaHei UI";
+		}
+		init = true;
+	}
+	return bold ? normalBold : normal;
+}
+
 static HFONT CreateFontByFace(const wchar_t* face, int pt, bool bold)
 {
 	LOGFONTW lf{}; lf.lfHeight = -MulDiv(pt, GetDeviceCaps(GetDC(nullptr), LOGPIXELSY), 72);
@@ -1057,10 +1463,13 @@ static void CreateControls(HWND hWnd)
 	SendMessageW(hL, CB_ADDSTRING, 0, (LPARAM)L"原版"); SendMessageW(hL, CB_ADDSTRING, 0, (LPARAM)L"Fabric"); SendMessageW(hL, CB_ADDSTRING, 0, (LPARAM)L"Forge"); SendMessageW(hL, CB_SETCURSEL, 0, 0);
 	HWND hJ = CreateWindowExW(WS_EX_CLIENTEDGE, WC_COMBOBOXW, L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 350, 46, 120, 200, hWnd, (HMENU)ID_COMBO_JAVA, g_hInst, nullptr);
 	SendMessageW(hJ, CB_ADDSTRING, 0, (LPARAM)L"自动"); SendMessageW(hJ, CB_ADDSTRING, 0, (LPARAM)L"8"); SendMessageW(hJ, CB_ADDSTRING, 0, (LPARAM)L"11"); SendMessageW(hJ, CB_ADDSTRING, 0, (LPARAM)L"17"); SendMessageW(hJ, CB_ADDSTRING, 0, (LPARAM)L"21"); SendMessageW(hJ, CB_ADDSTRING, 0, (LPARAM)L"25"); SendMessageW(hJ, CB_SETCURSEL, 0, 0);
-	HFONT hFontYahei = CreateFontByFace(L"Microsoft YaHei", 10, false);
+	
+	HFONT hFontYahei = CreateFontByFace(GetUIFontFace(), 10, false);
+	
 	HWND hDown = CreateWindowExW(0, L"BUTTON", L"开始下载", WS_CHILD | BS_PUSHBUTTON, 490, 46, 110, 28, hWnd, (HMENU)ID_BTN_DOWN, g_hInst, nullptr); SendMessageW(hDown, WM_SETFONT, (WPARAM)hFontYahei, TRUE);
+	HWND hCheck = CreateWindowExW(0, L"BUTTON", L"检查资源", WS_CHILD | BS_PUSHBUTTON, 610, 46, 110, 28, hWnd, (HMENU)ID_BTN_CHECK, g_hInst, nullptr); SendMessageW(hCheck, WM_SETFONT, (WPARAM)hFontYahei, TRUE);
 	HWND hLaunch = CreateWindowExW(0, L"BUTTON", L"启动游戏", WS_CHILD | BS_PUSHBUTTON, 730, 46, 110, 28, hWnd, (HMENU)ID_BTN_LAUNCH, g_hInst, nullptr); SendMessageW(hLaunch, WM_SETFONT, (WPARAM)hFontYahei, TRUE);
-	ShowWindow(hDown, SW_HIDE); ShowWindow(hLaunch, SW_HIDE);
+	ShowWindow(hDown, SW_HIDE); ShowWindow(hCheck, SW_HIDE); ShowWindow(hLaunch, SW_HIDE);
 	TabCtrl_SetCurSel(g_hTab, 0);
 	ShowWindow(GetDlgItem(hWnd, ID_EDIT_LOG), SW_SHOW);
 	ShowWindow(GetDlgItem(hWnd, ID_COMBO_VER), SW_HIDE);
@@ -1069,34 +1478,204 @@ static void CreateControls(HWND hWnd)
 	ShowWindow(GetDlgItem(hWnd, ID_BTN_LAUNCH), SW_SHOW);
 }
 
-static std::wstring BuildClasspath(const std::wstring& gameDir, const std::wstring& actualVer)
+static std::wstring ExtractJsonStringValue(const std::string& content, const std::string& key)
 {
-	std::wstring cp;
-	auto appendJar = [&](const std::wstring& jarAbs) { if (jarAbs.empty()) return; if (!cp.empty()) cp += L";"; cp += jarAbs; };
+	size_t p = content.find("\"" + key + "\"");
+	if (p == std::string::npos) return L"";
+	size_t colon = content.find(':', p + key.size() + 2);
+	if (colon == std::string::npos) return L"";
+	size_t q1 = content.find('"', colon + 1);
+	if (q1 == std::string::npos) return L"";
+	size_t q2 = content.find('"', q1 + 1);
+	if (q2 == std::string::npos) return L"";
+	return Utf8ToWide(content.substr(q1 + 1, q2 - q1 - 1));
+}
+
+static std::wstring ReadClasspathTxt(const std::wstring& txtPath)
+{
+	std::ifstream ifs(fs::path(txtPath), std::ios::binary);
+	if (!ifs) return L"";
+	std::stringstream ss; ss << ifs.rdbuf();
+	std::string content = ss.str();
+	std::wstring wide = Utf8ToWide(content);
 	
-	std::wstring verDir = gameDir + L"\\versions\\" + actualVer;
-	if (DirExistsW(verDir)) {
-		std::error_code ec;
-		for (auto& p : fs::directory_iterator(fs::path(verDir), ec)) {
-			if (ec) break;
-			if (!p.is_regular_file()) continue;
-			const auto& ext = p.path().extension().wstring();
-			if (_wcsicmp(ext.c_str(), L".jar") != 0) continue;
-			appendJar(p.path().wstring());
-		}
+	std::wstring cp;
+	std::set<std::wstring> seen;
+	size_t pos = 0;
+	while (pos <= wide.size())
+	{
+		size_t nl = wide.find_first_of(L"\r\n", pos);
+		std::wstring line = wide.substr(pos, (nl == std::wstring::npos ? wide.size() : nl) - pos);
+		pos = (nl == std::wstring::npos) ? wide.size() + 1 : nl + 1;
+		
+		while (!line.empty() && (line.front() == L' ' || line.front() == L'\t')) line.erase(line.begin());
+		while (!line.empty() && (line.back()  == L' ' || line.back()  == L'\t')) line.pop_back();
+		if (line.empty()) continue;
+		std::wstring norm = NormalizeWinPath(line);
+		if (!FileExistsW(norm)) continue;
+		if (seen.count(norm)) continue;
+		seen.insert(norm);
+		if (!cp.empty()) cp += L";";
+		cp += norm;
 	}
+	return cp;
+}
+
+static void CollectArtifactPathsFromJson(const std::wstring& jsonAbs,
+										 std::vector<std::wstring>& outRelPaths)
+{
+	if (!FileExistsW(jsonAbs)) return;
+	std::ifstream ifs(fs::path(jsonAbs), std::ios::binary);
+	if (!ifs) return;
+	std::stringstream ss; ss << ifs.rdbuf();
+	std::string content = ss.str();
+	
+	size_t pos = 0;
+	while ((pos = content.find("\"artifact\"", pos)) != std::string::npos)
+	{
+		size_t braceStart = content.find('{', pos);
+		if (braceStart == std::string::npos) break;
+		
+		int depth = 0; size_t braceEnd = std::string::npos;
+		for (size_t i = braceStart; i < content.size(); ++i)
+		{
+			if (content[i] == '{') depth++;
+			else if (content[i] == '}')
+			{
+				depth--;
+				if (depth == 0) { braceEnd = i; break; }
+			}
+		}
+		if (braceEnd == std::string::npos) break;
+		std::string seg = content.substr(braceStart, braceEnd - braceStart + 1);
+		
+		size_t pPos = seg.find("\"path\"");
+		if (pPos != std::string::npos)
+		{
+			size_t colon = seg.find(':', pPos + 6);
+			if (colon != std::string::npos)
+			{
+				size_t q1 = seg.find('"', colon + 1);
+				size_t q2 = (q1 != std::string::npos) ? seg.find('"', q1 + 1) : std::string::npos;
+				if (q1 != std::string::npos && q2 != std::string::npos && q2 > q1 + 1)
+				{
+					std::string rel = seg.substr(q1 + 1, q2 - q1 - 1);
+					if (rel.size() > 4 &&
+						rel.compare(rel.size() - 4, 4, ".jar") == 0)
+					{
+						outRelPaths.push_back(Utf8ToWide(rel));
+					}
+				}
+			}
+		}
+		pos = braceEnd;
+	}
+}
+
+static std::wstring BuildClasspath(const std::wstring& gameDir,
+								   const std::wstring& actualVer,
+								   bool strictForge)
+{
+	std::wstring exeDir = GetExeDir();
+	std::wstring tempDir = gameDir + L"\\temp";
+	EnsureDirectoryRecursiveW(tempDir);
+	
+	std::wstring baseMcVer = actualVer;
+	size_t fPos = baseMcVer.find(L"-forge");
+	if (fPos != std::wstring::npos) baseMcVer = baseMcVer.substr(0, fPos);
+	size_t fbPos = baseMcVer.find(L"-fabric");
+	if (fbPos != std::wstring::npos) baseMcVer = baseMcVer.substr(0, fbPos);
+	
+	bool isForgeVer  = (actualVer.find(L"-forge")  != std::wstring::npos);
+	bool isFabricVer = (actualVer.find(L"-fabric") != std::wstring::npos);
+	
+	if (isForgeVer || isFabricVer)
+	{
+		std::wstring jsAbs = exeDir + L"\\Node(YouMustNeed)v13\\build_cp.js";
+		std::wstring cpTxt = tempDir + L"\\cp.txt";
+		std::wstring mainTxt = tempDir + L"\\launch_main.txt";
+		
+		if (!FileExistsW(jsAbs))
+		{
+			AppendLog(L"[ERROR] [CP] 找不到 build_cp.js: " + jsAbs);
+			return L"";
+		}
+		
+		DeleteFileW(cpTxt.c_str());
+		DeleteFileW(mainTxt.c_str());
+		
+		std::vector<std::wstring> args;
+		args.push_back(jsAbs);
+		args.push_back(gameDir);
+		args.push_back(actualVer);
+		args.push_back(cpTxt);
+		if (isForgeVer)  args.push_back(L"--forge");
+		if (isFabricVer) args.push_back(L"--fabric");
+		
+		AppendLog(L"[CP] 调用 build_cp.js: ver=" + actualVer);
+		if (!RunNodeScript(exeDir, L"Node(YouMustNeed)v13\\node.exe", args, exeDir))
+		{
+			AppendLog(L"[ERROR] [CP] build_cp.js 执行失败");
+			return L"";
+		}
+		
+		if (!FileExistsW(cpTxt))
+		{
+			AppendLog(L"[ERROR] [CP] build_cp.js 未生成 cp.txt: " + cpTxt);
+			return L"";
+		}
+		
+		std::wstring cp = ReadClasspathTxt(cpTxt);
+		if (cp.empty())
+		{
+			AppendLog(L"[ERROR] [CP] cp.txt 为空或无有效 jar");
+			return L"";
+		}
+		
+		int cpCount = 1;
+		for (wchar_t c : cp) if (c == L';') cpCount++;
+		AppendLog(L"[CP] 从 cp.txt 读取成功，条目数: " + std::to_wstring(cpCount));
+		return cp;
+	}
+	
+	std::wstring cp;
+	std::set<std::wstring> seen;
+	auto appendJar = [&](const std::wstring& jarAbs)
+	{
+		if (jarAbs.empty()) return;
+		std::wstring norm = NormalizeWinPath(jarAbs);
+		if (seen.count(norm)) return;
+		if (!FileExistsW(norm)) return;
+		seen.insert(norm);
+		if (!cp.empty()) cp += L";";
+		cp += norm;
+	};
 	
 	std::wstring libsRoot = gameDir + L"\\libraries";
-	if (DirExistsW(libsRoot)) {
-		std::error_code ec;
-		for (auto& p : fs::recursive_directory_iterator(fs::path(libsRoot), ec)) {
-			if (ec) break; if (!p.is_regular_file()) continue;
-			const auto& ext = p.path().extension().wstring();
-			if (_wcsicmp(ext.c_str(), L".jar") != 0) continue;
-			appendJar(p.path().wstring());
+	std::wstring vanillaJson = gameDir + L"\\versions\\" + baseMcVer + L"\\" + baseMcVer + L".json";
+	if (FileExistsW(vanillaJson))
+	{
+		std::vector<std::wstring> relPaths;
+		CollectArtifactPathsFromJson(vanillaJson, relPaths);
+		for (const auto& rel : relPaths)
+			appendJar(NormalizeWinPath(libsRoot + L"\\" + rel));
+		AppendLog(L"[CP] 原版 JSON classpath 共 " + std::to_wstring(seen.size()) + L" 个 jar");
+	}
+	else
+	{
+		AppendLog(L"[WRN] [CP] 原版 JSON 缺失，退回 libraries 扫描（仅此分支）");
+		if (DirExistsW(libsRoot))
+		{
+			std::error_code ec;
+			for (auto& p : fs::recursive_directory_iterator(fs::path(libsRoot), ec))
+			{
+				if (ec) break; if (!p.is_regular_file()) continue;
+				if (_wcsicmp(p.path().extension().wstring().c_str(), L".jar") != 0) continue;
+				appendJar(p.path().wstring());
+			}
 		}
 	}
-	
+	appendJar(NormalizeWinPath(gameDir + L"\\versions\\" + baseMcVer + L"\\" + baseMcVer + L".jar"));
 	return cp;
 }
 
@@ -1108,26 +1687,24 @@ static bool LaunchMinecraft(const std::wstring& gameDir, const std::wstring& mcV
 	std::wstring resolved = ResolveJdkVersion(jdkVer);
 	bool is32 = Is32BitSystem();
 	if (is32 && (resolved == L"21" || resolved == L"25")) resolved = L"17";
-	AppendLog(L"[LAUNCH] 目标 Java 版本: " + resolved + L"，32 位系统: " + std::wstring(is32 ? L"yes" : L"no"));
 	
 	std::wstring javaExe;
 	std::vector<std::wstring> order;
 	order.push_back(resolved);
 	const wchar_t* rest[] = { L"17", L"21", L"11", L"8", L"25" };
 	for (auto r : rest) if (_wcsicmp(r, resolved.c_str()) != 0) order.push_back(r);
-	for (auto& v : order)
-	{
+	for (auto& v : order) {
 		if (is32 && (v == L"21" || v == L"25")) continue;
 		std::wstring dir = GetJavaVersionDir(v);
 		std::wstring exe = dir + L"\\bin\\java.exe";
-		if (FileExistsW(exe)) { javaExe = exe; AppendLog(L"[LAUNCH] 找到 Java " + v + L": " + exe); break; }
+		if (FileExistsW(exe)) { javaExe = exe; break; }
 		std::wstring found = FindJavaExeRecursive(dir);
-		if (!found.empty()) { javaExe = found; AppendLog(L"[LAUNCH] 递归找到 Java " + v + L": " + found); break; }
+		if (!found.empty()) { javaExe = found; break; }
 	}
 	if (javaExe.empty()) { AppendLog(L"[ERROR] 找不到 Java 路径"); return false; }
+	AppendLog(L"[LAUNCH] Java: " + javaExe);
 	
 	bool isModded = (mcVer.find(L"-forge") != std::wstring::npos || mcVer.find(L"-fabric") != std::wstring::npos);
-	
 	std::wstring actualVer = mcVer;
 	std::wstring verDir = gameDir + L"\\versions\\" + actualVer;
 	
@@ -1143,182 +1720,107 @@ static bool LaunchMinecraft(const std::wstring& gameDir, const std::wstring& mcV
 					actualVer = folderName;
 					verDir = p.path().wstring();
 					isModded = true;
-					AppendLog(L"[LAUNCH] 自动检测到扩展版本: " + actualVer);
 					break;
 				}
 			}
 		}
 	}
+	AppendLog(L"[LAUNCH] 实际版本号: " + actualVer);
 	
-	std::wstring mainClass = L"net.minecraft.client.main.Main";
-	std::wstring launchCfg = verDir + L"\\fabric_launch_config.txt";
-	if (FileExistsW(launchCfg))
-	{
-		std::ifstream ifs(fs::path(launchCfg), std::ios::binary);
-		if (ifs) {
-			std::string line;
-			while (std::getline(ifs, line)) {
-				if (line.size() >= 5 && line.substr(0, 5) == "MAIN=") {
-					std::string cls = line.substr(5);
-					while (!cls.empty() && (cls.back() == '\r' || cls.back() == ' ' || cls.back() == '\t')) cls.pop_back();
-					if (!cls.empty()) mainClass = Utf8ToWide(cls);
-					break;
-				}
-			}
-		}
-		AppendLog(L"[LAUNCH] 从 fabric_launch_config.txt 读取 mainClass: " + mainClass);
-	}
-	else {
-		AppendLog(L"[LAUNCH] 未找到 fabric_launch_config.txt，使用原版默认主类: " + mainClass);
-	}
-	
-	std::wstring classpath = BuildClasspath(gameDir, actualVer);
+	bool isForge = (actualVer.find(L"-forge") != std::wstring::npos);
+	std::wstring classpath = BuildClasspath(gameDir, actualVer, isForge);
 	if (classpath.empty()) { AppendLog(L"[ERROR] classpath 为空"); return false; }
 	
-	std::wstring baseVer = mcVer;
-	if (baseVer.find(L"-forge") != std::wstring::npos) baseVer = baseVer.substr(0, baseVer.find(L"-forge"));
-	else if (baseVer.find(L"-fabric") != std::wstring::npos) baseVer = baseVer.substr(0, baseVer.find(L"-fabric"));
+	std::wstring jsArgsAbs = GetExeDir() + L"\\Node(YouMustNeed)v13\\build_args.js";
+	std::wstring argsTxtPath = gameDir + L"\\args.txt";
 	
-	// 强行把原版核心追加进去
-	std::wstring vanillaJar = gameDir + L"\\versions\\" + baseVer + L"\\" + baseVer + L".jar";
-	if (!FileExistsW(vanillaJar))
-	{
-		AppendLog(L"[ERROR] 找不到原版核心，无法启动！路径: " + vanillaJar);
-		return false;
-	}
-	if (!classpath.empty()) classpath += L";";
-	classpath += vanillaJar;
-	AppendLog(L"[LAUNCH] 强制追加原版核心 jar: " + vanillaJar);
+	std::vector<std::wstring> args;
+	args.push_back(jsArgsAbs);
+	args.push_back(gameDir);
+	args.push_back(actualVer);
+	args.push_back(L"Player");
 	
-	// 扫描 Forge 专属库
-	if (actualVer.find(L"-forge") != std::wstring::npos) {
-		AppendLog(L"[LAUNCH] 检测到 Forge 版本，强制扫描 Forge 专属库...");
-		std::vector<std::wstring> forgeDirs = {
-			gameDir + L"\\libraries\\net\\minecraftforge",
-			gameDir + L"\\libraries\\cpw\\mods"
-		};
-		for (const auto& fd : forgeDirs) {
-			if (DirExistsW(fd)) {
-				std::error_code ec;
-				for (auto& p : fs::recursive_directory_iterator(fs::path(fd), ec)) {
-					if (ec) break;
-					if (!p.is_regular_file()) continue;
-					if (_wcsicmp(p.path().extension().wstring().c_str(), L".jar") != 0) continue;
-					if (!classpath.empty()) classpath += L";";
-					classpath += p.path().wstring();
-				}
-			}
-		}
-	}
-	
-	std::wstring xmx = is32 ? L"-Xmx1G" : L"-Xmx2G";
-	std::wstring nativesDir = verDir + L"\\natives";
-	
-	std::wstring isolatedGameDir;
-	if (actualVer.find(L"-forge") != std::wstring::npos || actualVer.find(L"-fabric") != std::wstring::npos) {
-		isolatedGameDir = verDir;
-		AppendLog(L"[LAUNCH] 启用独立隔离游戏目录: " + isolatedGameDir);
-	} else {
-		isolatedGameDir = gameDir;
-	}
-	
-	EnsureDirectoryRecursiveW(isolatedGameDir + L"\\saves");
-	EnsureDirectoryRecursiveW(isolatedGameDir + L"\\logs");
-	EnsureDirectoryRecursiveW(isolatedGameDir + L"\\mods");
-	
-	std::wstring assetIndexId = baseVer;
-	std::wstring vanillaJson = gameDir + L"\\versions\\" + baseVer + L"\\" + baseVer + L".json";
-	if (FileExistsW(vanillaJson)) {
-		std::string content;
-		std::ifstream ifs(fs::path(vanillaJson), std::ios::binary);
-		if (ifs) { std::stringstream ss; ss << ifs.rdbuf(); content = ss.str(); }
-		size_t p = content.find("\"assetIndex\"");
-		if (p != std::string::npos) {
-			size_t braceStart = content.find('{', p);
-			if (braceStart != std::string::npos) {
-				int depth = 0; size_t end = std::string::npos;
-				for (size_t i = braceStart; i < content.size(); ++i) {
-					if (content[i] == '{') depth++;
-					else if (content[i] == '}') { depth--; if (depth == 0) { end = i; break; } }
-				}
-				if (end != std::string::npos) {
-					std::string seg = content.substr(braceStart, end - braceStart + 1);
-					size_t idPos = seg.find("\"id\"");
-					if (idPos != std::string::npos) {
-						size_t c = seg.find(':', idPos + 4);
-						if (c != std::string::npos) {
-							size_t q1 = seg.find('"', c + 1);
-							size_t q2 = (q1 != std::string::npos) ? seg.find('"', q1 + 1) : std::string::npos;
-							if (q1 != std::string::npos && q2 != std::string::npos) {
-								assetIndexId = Utf8ToWide(seg.substr(q1 + 1, q2 - q1 - 1));
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-	AppendLog(L"[LAUNCH] 最终使用的 assetIndex: " + assetIndexId);
-	
-	std::wstring assetsDir = gameDir + L"\\assets";
-	
-	std::wstring cmdLine =
-	L"\"" + javaExe + L"\" " + xmx +
-	L" -Djava.library.path=\"" + nativesDir + L"\"" +
-	L" -cp \"" + classpath + L"\" " + mainClass +
-	L" --username Player --uuid 00000000000000000000000000000000 --accessToken 0"
-	L" --userType legacy --userProperties {} --version \"" + actualVer + L"\"" +
-	L" --gameDir \"" + isolatedGameDir + L"\"" + 
-	L" --assetsDir \"" + assetsDir + L"\"" +
-	L" --assetIndex \"" + assetIndexId + L"\"";
-	
-	if (!DirExistsW(isolatedGameDir))
-	{
-		AppendLog(L"[ERROR] 游戏目录不存在: " + isolatedGameDir);
+	if (!RunNodeScript(GetExeDir(), L"Node(YouMustNeed)v13\\node.exe", args, GetExeDir())) {
+		AppendLog(L"[ERROR] build_args.js 执行失败");
 		return false;
 	}
 	
-	AppendLog(L"[DEBUG] 准备执行的完整命令行如下:");
-	AppendLog(cmdLine);
+	std::ifstream ifs(fs::path(argsTxtPath), std::ios::binary);
+	std::stringstream ss; ss << ifs.rdbuf();
+	std::string jsContent = ss.str();
+	ifs.close();
+	
+	// 5. C++ 强行接管：内存、Classpath、主类
+	std::string finalTxt;
+	
+	// 1. 内存参数
+	std::string xmxStr = WideToUtf8(GetXmxArg());
+	for (char c : xmxStr) {
+		if (c == ' ') finalTxt += "\r\n";
+		else finalTxt += c;
+	}
+	finalTxt += "\r\n";
+	
+	// 2. Classpath
+	finalTxt += "-cp\r\n";
+	finalTxt += WideToUtf8(classpath) + "\r\n";
+	
+	// 3. 主类：直接读 JS 写的文件，不要自己瞎猜！
+	std::string mainCls = "net.minecraft.client.main.Main";
+	std::wstring mainTxtPath = gameDir + L"\\temp\\launch_main.txt";
+	if (FileExistsW(mainTxtPath)) {
+		std::string mc = ReadWholeFileA(mainTxtPath);
+		std::wstring wMc = Utf8ToWide(mc);
+		while (!wMc.empty() && (wMc.back() == L'\r' || wMc.back() == L'\n' || wMc.back() == L' ')) wMc.pop_back();
+		if (!wMc.empty()) mainCls = WideToUtf8(wMc);
+	}
+	finalTxt += mainCls + "\r\n";
+	
+	// 4. 接上 JS 吐出的纯游戏参数
+	finalTxt += jsContent;
+	
+	// 5. 写入文件
+	FILE* fp = _wfopen(argsTxtPath.c_str(), L"wb");
+	if (fp) {
+		fwrite(finalTxt.c_str(), 1, finalTxt.size(), fp);
+		fclose(fp);
+	}
+	
+	AppendLog(L"[LAUNCH] 内存、CP、主类由 C++ 注入完成，游戏参数由 JS 注入完成");
+	
+	std::wstring cmdLine = L"\"" + javaExe + L"\" @\"" + argsTxtPath + L"\"";
+	
+	AppendLog(L"[LAUNCH] 命令行: " + cmdLine);
 	
 	STARTUPINFOW si{}; si.cb = sizeof(si);
 	PROCESS_INFORMATION pi{};
-	
 	std::vector<wchar_t> cmdBuffer(cmdLine.begin(), cmdLine.end());
 	cmdBuffer.push_back(L'\0');
 	
 	BOOL ok = CreateProcessW(
-							 nullptr,
-							 &cmdBuffer[0],
-							 nullptr, nullptr,
-							 FALSE,
-							 CREATE_NO_WINDOW,
-							 nullptr,
-							 isolatedGameDir.c_str(),
+							 nullptr, &cmdBuffer[0],
+							 nullptr, nullptr, FALSE,
+							 CREATE_NO_WINDOW, nullptr,
+							 gameDir.c_str(),
 							 &si, &pi);
 	
-	if (!ok)
-	{
-		DWORD err = GetLastError();
-		AppendLog(L"[ERROR] CreateProcessW 失败，GetLastError() = " + std::to_wstring(err));
+	if (!ok) {
+		AppendLog(L"[ERROR] CreateProcessW 失败，GetLastError() = " + std::to_wstring(GetLastError()));
 		return false;
 	}
+	
 	AppendLog(L"[LAUNCH] 已拉起 Java 进程 PID=" + std::to_wstring(pi.dwProcessId));
 	
 	DWORD waitRes = WaitForSingleObject(pi.hProcess, 3000);
-	if (waitRes == WAIT_OBJECT_0)
-	{
+	if (waitRes == WAIT_OBJECT_0) {
 		DWORD exitCode = 0;
 		GetExitCodeProcess(pi.hProcess, &exitCode);
 		AppendLog(L"[ERROR] Java 进程瞬间退出，exitCode = " + std::to_wstring(exitCode));
 		CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
 		return false;
 	}
-	if (waitRes == WAIT_TIMEOUT)
-	{
-		AppendLog(L"[LAUNCH] 3000ms 后进程仍在运行（正常）");
-	}
 	
+	AppendLog(L"[LAUNCH] 3000ms 后进程仍在运行（正常）");
 	CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
 	return true;
 }
@@ -1355,6 +1857,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			ShowWindow(GetDlgItem(hWnd, ID_COMBO_LOADER), SW_HIDE);
 			ShowWindow(GetDlgItem(hWnd, ID_COMBO_JAVA), SW_HIDE);
 			ShowWindow(GetDlgItem(hWnd, ID_BTN_DOWN), SW_HIDE);
+			ShowWindow(GetDlgItem(hWnd, ID_BTN_CHECK), SW_HIDE);
 			ShowWindow(GetDlgItem(hWnd, ID_BTN_LAUNCH), SW_SHOW);
 		}
 		return 0;
@@ -1367,6 +1870,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 				ShowWindow(GetDlgItem(hWnd, ID_COMBO_LOADER), sel == 1 ? SW_SHOW : SW_HIDE);
 				ShowWindow(GetDlgItem(hWnd, ID_COMBO_JAVA), sel == 1 ? SW_SHOW : SW_HIDE);
 				ShowWindow(GetDlgItem(hWnd, ID_BTN_DOWN), sel == 1 ? SW_SHOW : SW_HIDE);
+				ShowWindow(GetDlgItem(hWnd, ID_BTN_CHECK), sel == 1 ? SW_SHOW : SW_HIDE);
 				ShowWindow(GetDlgItem(hWnd, ID_BTN_LAUNCH), sel == 0 ? SW_SHOW : SW_HIDE);
 			}
 			return 0;
@@ -1382,14 +1886,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 					AppendLog(L"[JOB] 流水线开始");
 					if (g_bIsExitRequested) return;
 					
-					// 1. 强前置：原生 Java + 原版核心流水线
 					if (!DownloadJavaForHost(jdkVer)) { AppendLog(L"[JOB] Java 失败"); return; }
 					if (g_bIsExitRequested) return;
 					
 					if (!ParseVanillaWithNode(exeDir, mcVer)) { AppendLog(L"[JOB] 原版基础失败，流水线终止"); return; }
 					if (g_bIsExitRequested) return;
 					
-					// 2. 按需执行模组加载器流水线
 					if (loader == L"Fabric") {
 						if (!ParseFabricWithNode(exeDir, mcVer)) { AppendLog(L"[JOB] Fabric 失败"); return; }
 					}
@@ -1407,6 +1909,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 					if (g_bIsExitRequested) return;
 					AppendLog(L"[JOB] 流水线全部完成");
 					if (!g_bIsExitRequested && g_hMainWnd) PostMessageW(g_hMainWnd, WM_APP_SWITCH_HOME, 0, 0);
+				}).detach();
+			}
+			else if (id == ID_BTN_CHECK) {
+				std::wstring mcVer = GetSelectedMcVersion();
+				std::wstring gameDir = GetGameDir();
+				std::thread([=]() {
+					RunFullCheck(gameDir, mcVer);
 				}).detach();
 			}
 			else if (id == ID_BTN_LAUNCH) {
@@ -1430,9 +1939,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		}
 		case WM_ERASEBKGND: return 1;
 	case WM_CLOSE:
-		g_bIsExitRequested = true; KillChildProcesses(); DestroyWindow(hWnd); return 0;
+		g_bIsExitRequested = true; 
+		KillChildProcesses(); 
+		CleanupTempFiles();
+		DestroyWindow(hWnd); 
+		return 0;
 	case WM_DESTROY:
-		g_bIsExitRequested = true; KillChildProcesses(); PostQuitMessage(0); return 0;
+		g_bIsExitRequested = true; 
+		KillChildProcesses(); 
+		CleanupTempFiles();
+		PostQuitMessage(0); 
+		return 0;
 	}
 	return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
@@ -1457,3 +1974,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow)
 	GdiplusShutdown(g_gdiplusToken);
 	return (int)msg.wParam;
 }
+/*永久感谢：
+Bang bang 93-提供mc下载
+gh-proxy-提供JAVA加速服务
+Adoptium-提供JAVA下载
+Brecht Sanders-提供比什么东西都好用的编译器
+Microsoft-提供Win32API（让我写鼠标指针控制的时候不再让我的手指无法形容）
+感谢以上所有人
+Thanks everyone
+（我是小学生捐不了款，再次表示致谢）
+*/
